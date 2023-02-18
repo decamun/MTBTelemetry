@@ -61,6 +61,13 @@ def rotated_vector(r, v):
     k=r.apply(v)
     return vector(k[0],k[1],k[2])
 
+def apply_floating_average(QV, Q_floating_average, alpha=0.99):
+    Q_floating_average = alpha*Q_floating_average + (1.0-alpha)*QV
+    QVN = QV
+    QVN[0:2] = QVN[0:2]*(1-np.linalg.norm(Q_floating_average[0:2])/np.linalg.norm(QVN[0:2]))
+    QVN[3] = QVN[3]-Q_floating_average[3]
+    return QVN, Q_floating_average
+
 #setup VPython scene
 scene.range=5
 toRad=2*np.pi/360
@@ -85,6 +92,8 @@ magArrow=arrow(shaftwidth=.1,color=(color.purple*0.5),axis=vector(0,0,1))
 # frontArrowEuler=arrow(shaftwidth=.1,color=(color.cyan*0.5),axis=vector(1,0,0))
 # sideArrowEuler=arrow(shaftwidth=.1,color=(color.cyan*0.5),axis=vector(0,0,1))
 # upArrowEuler=arrow(shaftwidth=.1,color=(color.cyan*0.5),axis=vector(0,1,0))
+
+Q_floating_average = np.asarray([0,0,0,0])
 
 #loop
 while (True):
@@ -117,9 +126,9 @@ while (True):
         MZ=float(splitPacket[15])
 
         #Generate Quaternion
-        Q6V = with_scalar_component([Q6_1, Q6_2, Q6_3])
-        Q9V = with_scalar_component([Q9_1, Q9_2, Q9_3])
-        Q = Rotation.from_quat(Q6V)
+        QV = with_scalar_component([Q6_1, Q6_2, Q6_3])
+        QVN, Q_floating_average = apply_floating_average(QV, Q_floating_average, alpha=0.95) #This doesn't work yet #TODO get this to work right.
+        Q = Rotation.from_quat(QV)
 
         #Use Quaternion to rotate the unit vectors
         v1=rotated_vector(Q, np.array([1,0,0]))
