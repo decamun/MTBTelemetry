@@ -62,7 +62,7 @@ Apollo3RTC myRTC;
 #define IMU_ISM330DHCX 0x6B
 #define IMU_ISM330DHCX_ALT 0x6A
 #define LIDAR_VL53L1X 0x29
-#define UBX_GNSS 0x42
+#define GNSS_UBX 0x42
 #define IMU_ICM20948_SPI 0x00
 
 
@@ -194,6 +194,102 @@ class BTSensor {
     }
 };
 
+class BT_UBLOX : public BTSensor {
+  private:
+    SFE_UBLOX_GNSS *sensorPtr = NULL;
+    long lattiude = 0;
+    long longitude = 0;
+    long altitudeMSL = 0;
+    long speed = 0;
+    long heading = 0;
+    long pDOP = 0;
+    String datetime = "";
+
+
+    bool checkData() override {
+      //Check if new data is available
+      return true; //you can always talk to the GPS
+    }
+
+    void readData() override {
+      //Read new data
+      this->lattiude = (this->sensorPtr)->getLatitude();
+      this->longitude = (this->sensorPtr)->getLatitude();
+      this->altitudeMSL = (this->sensorPtr)->getAltitudeMSL();
+      this->speed = (this->sensorPtr)->getGroundSpeed();
+      this->heading = (this->sensorPtr)->getHeading();
+      this->pDOP = (this->sensorPtr)->getPDOP();
+
+
+      
+      //Get Datetime
+      char buffer[100];
+      sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+        (this->sensorPtr)->getYear(), 
+        (this->sensorPtr)->getMonth(), 
+        (this->sensorPtr)->getDay(), 
+        (this->sensorPtr)->getHour(), 
+        (this->sensorPtr)->getMinute(), 
+        (this->sensorPtr)->getSecond()); //TODO TIME
+      this->datetime = String(buffer);
+    }
+
+    String logData() override {
+      //Log data
+      String logline = "";
+      logline += "," + this->datetime;
+      logline += "," + String(this->lattiude);
+      logline += "," + String(this->longitude);
+      logline += "," + String(this->altitudeMSL);
+      logline += "," + String(this->speed);
+      logline += "," + String(this->heading);
+      logline += "," + String(this->pDOP);
+      return logline;
+    }
+
+  public:
+    BT_UBLOX(uint8_t address) : BTSensor(address) {
+      //Sensor constructor
+      this->setAddress(address);
+      this->setHelperText(",datetime,lattitude,longitude,altitude,speed,heading,pDOP");
+      this->setDataOutputs(7);
+      Serial.print("U-blox GNSS sensor constructed.");
+    }
+
+    ~BT_UBLOX() {
+      //Sensor destructor 
+      delete this->sensorPtr;
+    }
+
+    bool begin() override {
+      //Sensor begin
+      Serial.print("U-blox begin: 0x");
+      Serial.println(this->getAddress(), HEX);
+      
+      //create a new instance of the GPS class
+      SFE_UBLOX_GNSS *myGPS = new SFE_UBLOX_GNSS;
+      
+      //attempt to begin communication with the module
+      setQwiicPullups(0); //turn off Qwiic Pullups for U-Blox
+      bool began = myGPS->begin(qwiic, this->getAddress());
+      
+      if(!began) { //Something went wrong
+        Serial.println("U-blox begin failed.");
+      }
+      else {
+        Serial.println("U-blox online!"); 
+        this->sensorPtr = myGPS;
+      }
+
+      //clean up
+      setQwiicPullups(1); //turn Qwiic back on 
+      //TODO make the above use a global setting.  
+      this->set_running(began);
+      return began;
+
+    }
+};
+
 class BT_ISM330DHCX : public BTSensor {
   private:
     SparkFun_ISM330DHCX *sensorPtr;
@@ -258,6 +354,7 @@ class BT_ISM330DHCX : public BTSensor {
     }
     ~BT_ISM330DHCX() {
       //ISM330DHCX destructor
+      delete this->sensorPtr;
     }
 
     bool begin() override {
@@ -480,6 +577,8 @@ void setup() {
 
   //Detect and initialize sensors
   //TODO: Autodetect connected sensors
+  
+  //IMU #1
   addSensor(new SensorNode {
     getInterval(150.0), //150 Hz
     IMU_ISM330DHCX,
@@ -487,6 +586,8 @@ void setup() {
     millis(),
     NULL
   });
+
+  //IMU #2
   addSensor(new SensorNode {
     getInterval(150.0), //150 Hz
     IMU_ISM330DHCX_ALT,
@@ -494,6 +595,8 @@ void setup() {
     millis(),
     NULL
   });
+
+  //Lidar sensor
   addSensor(new SensorNode {
     getInterval(50.0), //50 Hz
     LIDAR_VL53L1X,
@@ -501,7 +604,16 @@ void setup() {
     millis(),
     NULL
   });
-  //TODO: Add GNSS
+
+  //GNSS sensor
+  addSensor(new SensorNode {
+    getInterval(0.1), //1Hz
+    GNSS_UBX,
+    new BT_UBLOX(GNSS_UBX),
+    millis(),
+    NULL
+  });
+
   //TODO: Add ICM20948
 
   //begin sensors:
@@ -582,7 +694,13 @@ void loop() {
         //log data
         logline += node->sensor->log();
         if (node->sensor->didLog()) {
-          node->lastLogTime = currentTime;
+          if(millis() - currentTime > node->logInterval) {
+            //count from the end of logging to avoid bogging
+            node->lastLogTime = millis();
+          } else {
+            //default to counting from the beginning of logging
+            node->lastLogTime = currentTime;
+          }
         }
       } else {
         //just print commas
