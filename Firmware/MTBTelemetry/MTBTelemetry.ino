@@ -5,6 +5,8 @@
 #define HARDWARE_VERSION_MAJOR 1
 #define HARDWARE_VERSION_MINOR 0
 
+#define SD_STRESS_TEST 0 //Turn this on to conduct an SD stress test
+
 #if(HARDWARE_VERSION_MAJOR == 0 && HARDWARE_VERSION_MINOR == 4)
 const byte PIN_MICROSD_CHIP_SELECT = 10;
 const byte PIN_IMU_POWER = 22;
@@ -44,13 +46,38 @@ TwoWire qwiic(PIN_QWIIC_SDA,PIN_QWIIC_SCL);
 
 #include <Arduino.h>
 #include <SPI.h> //SPI Library
-//#include <SdFat.h> //SD Card Library
+#include <SdFat.h> //SD Card Library
+
+File logFile;
+#define NEW_LINE_STR F("\n\r")
+
+
+#define SD_FAT_TYPE 3 // SD_FAT_TYPE = 0 for SdFat/File, 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
+#define SD_CONFIG SdSpiConfig(PIN_MICROSD_CHIP_SELECT, SHARED_SPI, SD_SCK_MHZ(24)) // 24MHz
+
+#if SD_FAT_TYPE == 1
+SdFat32 sd;
+File32 sensorDataFile; //File that all sensor data is written to
+File32 serialDataFile; //File that all incoming serial data is written to
+#elif SD_FAT_TYPE == 2
+SdExFat sd;
+ExFile sensorDataFile; //File that all sensor data is written to
+ExFile serialDataFile; //File that all incoming serial data is written to
+#elif SD_FAT_TYPE == 3
+SdFs sd;
+FsFile sensorDataFile; //File that all sensor data is written to
+FsFile serialDataFile; //File that all incoming serial data is written to
+#else // SD_FAT_TYPE == 0
+SdFat sd;
+File sensorDataFile; //File that all sensor data is written to
+File serialDataFile; //File that all incoming serial data is written to
+#endif  // SD_FAT_TYPE
+
 
 #include "SparkFun_u-blox_GNSS_Arduino_Library.h" //http://librarymanager/All#SparkFun_u-blox_GNSS
 #include "SparkFun_ISM330DHCX.h" // Click here to get the library: http://librarymanager/All#SparkFun_6DoF_ISM330DHCX
 #include "SparkFun_VL53L1X.h" //Click here to get the library: http://librarymanager/All#SparkFun_VL53L1X
-
-#include "my_dtostrf.h" //Custom dtostrf function
+#include "ICM_20948.h"  // Click here to get the library: http://librarymanager/All#SparkFun_ICM_20948_IMU
 #include "support.h"
 
 
@@ -98,7 +125,7 @@ class BTSensor {
     BTSensor(uint8_t address) {
       //Sensor constructor
       this->address = address;
-      Serial.print("Sensor object created. Address: 0x");
+      Serial.print(F("Sensor object created. Address: 0x"));
       Serial.println(address, HEX);
     }
     ~BTSensor() {
@@ -107,7 +134,7 @@ class BTSensor {
 
     virtual bool begin() {
       //Sensor begin
-      Serial.println("Attempting to begin generic sensor object. Nothing to do.");
+      Serial.println(F("Attempting to begin generic sensor object. Nothing to do."));
       return false;
     }
 
@@ -194,6 +221,164 @@ class BTSensor {
     }
 };
 
+class BT_ICM20948_SPI : public BTSensor {
+  private:
+    ICM_20948_SPI *sensorPtr = NULL;
+    
+    bool checkData() override {
+      if (this->sensorPtr->dataReady()) {
+        return true;
+      } else {
+        return false;
+      }
+    }
+    void readData() override {
+      (this->sensorPtr->getAGMT());
+    }
+
+    String logData() override {
+      char buffer1[10];
+      char buffer2[10];
+      char buffer3[10];
+      char buffer4[10];
+      char buffer5[10];
+      char buffer6[10];
+      char buffer7[10];
+      char logline[100];
+
+      //Store logged sensor data in buffers
+      olaftoa(this->sensorPtr->accX(), buffer1, 3, sizeof(buffer1) / sizeof(char));
+      olaftoa(this->sensorPtr->accY(), buffer2, 3, sizeof(buffer2) / sizeof(char));
+      olaftoa(this->sensorPtr->accZ(), buffer3, 3, sizeof(buffer3) / sizeof(char));
+      olaftoa(this->sensorPtr->gyrX(), buffer4, 3, sizeof(buffer4) / sizeof(char));
+      olaftoa(this->sensorPtr->gyrY(), buffer5, 3, sizeof(buffer5) / sizeof(char));
+      olaftoa(this->sensorPtr->gyrZ(), buffer6, 3, sizeof(buffer6) / sizeof(char));
+      olaftoa(this->sensorPtr->temp(), buffer7, 3, sizeof(buffer7) / sizeof(char));
+
+      //Convert buffers to CSV string
+      sprintf(logline, ",%s,%s,%s,%s,%s,%s,%s", buffer1, buffer2, buffer3, buffer4, buffer5, buffer6, buffer7);
+      return String(logline);
+    }
+
+    void imuPowerOn() {
+      pinMode(PIN_IMU_POWER, OUTPUT);
+      pin_config(PinName(PIN_IMU_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+      digitalWrite(PIN_IMU_POWER, HIGH);
+    }
+
+    void imuPowerOff() {
+      pinMode(PIN_IMU_POWER, OUTPUT);
+      pin_config(PinName(PIN_IMU_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+      digitalWrite(PIN_IMU_POWER, LOW);
+    }
+
+    void imuReset(uint8_t offTime, uint8_t breatherTime) {
+      //Reset ICM by power cycling it
+      this->imuPowerOff();
+      delay(offTime);
+      this->imuPowerOn();
+      delay(breatherTime);
+    }
+
+  public:
+    BT_ICM20948_SPI(uint8_t address) : BTSensor(address) {
+      //Sensor constructor
+      this->setDataOutputs(7);
+      this->setHelperText(F(",AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ,Temp"));
+      Serial.println(F("ICM20948 (SPI) sensor constructed."));
+    }
+    ~BT_ICM20948_SPI() {
+      //Sensor destructor 
+      delete this->sensorPtr;
+    }
+
+    bool begin() override {
+      //Adapted from Sparkfun Openlog Artemis firmware
+
+      ICM_20948_SPI myICM;
+
+      pinMode(PIN_IMU_POWER, OUTPUT);
+      pin_config(PinName(PIN_IMU_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+      pinMode(PIN_IMU_CHIP_SELECT, OUTPUT);
+      pin_config(PinName(PIN_IMU_CHIP_SELECT), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+      digitalWrite(PIN_IMU_CHIP_SELECT, HIGH); //Be sure IMU is deselected
+
+      this->imuReset(10, 25);
+
+      myICM.begin(PIN_IMU_CHIP_SELECT, SPI, 4000000); //Set IMU SPI rate to 4MHz
+      if (myICM.status != ICM_20948_Stat_Ok)
+      {
+        Serial.println("beginIMU: first attempt at myICM.begin failed. myICM.status = " + (String)myICM.status + "\r\n");
+        //Try one more time with longer wait
+        this->imuReset(40, 200);
+
+        myICM.begin(PIN_IMU_CHIP_SELECT, SPI, 4000000); //Set IMU SPI rate to 4MHz
+        if (myICM.status != ICM_20948_Stat_Ok)
+        {
+          Serial.println("beginIMU: second attempt at myICM.begin failed. myICM.status = " + (String)myICM.status + "\r\n");
+          digitalWrite(PIN_IMU_CHIP_SELECT, HIGH); //Be sure IMU is deselected
+          this->imuPowerOff();
+
+          //We have failed... for now!
+          this->set_running(false);
+          return false;
+        }
+      }
+      
+      bool success = true;
+
+      //Perform a full startup (not minimal) for non-DMP mode
+      ICM_20948_Status_e retval = myICM.startupDefault(false);
+      if (retval != ICM_20948_Stat_Ok)
+      {
+        Serial.println(F("Error: Could not startup the IMU in non-DMP mode!"));
+        success = false;
+      }
+      //Update the full scale and DLPF settings
+      retval = myICM.enableDLPF(ICM_20948_Internal_Acc, false);
+      if (retval != ICM_20948_Stat_Ok)
+      {
+        Serial.println(F("Error: Could not configure the IMU Accelerometer DLPF!"));
+        success = false;
+      }
+      retval = myICM.enableDLPF(ICM_20948_Internal_Gyr, false);
+      if (retval != ICM_20948_Stat_Ok)
+      {
+        Serial.println(F("Error: Could not configure the IMU Gyro DLPF!"));
+        success = false;
+      }
+      ICM_20948_dlpcfg_t dlpcfg;
+      dlpcfg.a = 7;
+      dlpcfg.g = 7;
+      retval = myICM.setDLPFcfg((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), dlpcfg);
+      if (retval != ICM_20948_Stat_Ok)
+      {
+        Serial.println(F("Error: Could not configure the IMU DLPF BW!"));
+        success = false;
+      }
+      ICM_20948_fss_t FSS;
+      FSS.a = 0;
+      FSS.g = 0;
+      retval = myICM.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), FSS);
+      if (retval != ICM_20948_Stat_Ok)
+      {
+        Serial.println(F("Error: Could not configure the IMU Full Scale!"));
+        success = false;
+      }
+
+      if(success) {
+        this->sensorPtr = &myICM;
+        this->set_running(true);
+        delay(50);
+        return true;
+      } else {
+        this->imuPowerOff();
+        this->set_running(false);
+        return false;
+      }
+    }
+};
+
 class BT_UBLOX : public BTSensor {
   private:
     SFE_UBLOX_GNSS *sensorPtr = NULL;
@@ -203,7 +388,7 @@ class BT_UBLOX : public BTSensor {
     long speed = 0;
     long heading = 0;
     long pDOP = 0;
-    String datetime = "";
+    char datetime[32];
 
 
     bool checkData() override {
@@ -224,36 +409,36 @@ class BT_UBLOX : public BTSensor {
       
       //Get Datetime
       char buffer[100];
-      sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+      sprintf(this->datetime, "%04d-%02d-%02d %02d:%02d:%02d", 
         (this->sensorPtr)->getYear(), 
         (this->sensorPtr)->getMonth(), 
         (this->sensorPtr)->getDay(), 
         (this->sensorPtr)->getHour(), 
         (this->sensorPtr)->getMinute(), 
-        (this->sensorPtr)->getSecond()); //TODO TIME
-      this->datetime = String(buffer);
+        (this->sensorPtr)->getSecond());
     }
 
     String logData() override {
       //Log data
-      String logline = "";
-      logline += "," + this->datetime;
-      logline += "," + String(this->lattiude);
-      logline += "," + String(this->longitude);
-      logline += "," + String(this->altitudeMSL);
-      logline += "," + String(this->speed);
-      logline += "," + String(this->heading);
-      logline += "," + String(this->pDOP);
-      return logline;
+      char logline[100];
+      sprintf(logline, ",%s, %ld, %ld, %ld, %ld, %ld, %ld", 
+        this->datetime, 
+        this->lattiude, 
+        this->longitude, 
+        this->altitudeMSL, 
+        this->speed, 
+        this->heading, 
+        this->pDOP);
+      return String(logline);
     }
 
   public:
     BT_UBLOX(uint8_t address) : BTSensor(address) {
       //Sensor constructor
       this->setAddress(address);
-      this->setHelperText(",datetime,lattitude,longitude,altitude,speed,heading,pDOP");
+      this->setHelperText(F(",datetime,lattitude,longitude,altitude,speed,heading,pDOP"));
       this->setDataOutputs(7);
-      Serial.print("U-blox GNSS sensor constructed.");
+      Serial.println(F("U-blox GNSS sensor constructed."));
     }
 
     ~BT_UBLOX() {
@@ -263,7 +448,7 @@ class BT_UBLOX : public BTSensor {
 
     bool begin() override {
       //Sensor begin
-      Serial.print("U-blox begin: 0x");
+      Serial.print(F("U-blox begin: 0x"));
       Serial.println(this->getAddress(), HEX);
       
       //create a new instance of the GPS class
@@ -274,10 +459,10 @@ class BT_UBLOX : public BTSensor {
       bool began = myGPS->begin(qwiic, this->getAddress());
       
       if(!began) { //Something went wrong
-        Serial.println("U-blox begin failed.");
+        Serial.println(F("U-blox begin failed."));
       }
       else {
-        Serial.println("U-blox online!"); 
+        Serial.println(F("U-blox online!")); 
         this->sensorPtr = myGPS;
       }
 
@@ -293,8 +478,8 @@ class BT_UBLOX : public BTSensor {
 class BT_ISM330DHCX : public BTSensor {
   private:
     SparkFun_ISM330DHCX *sensorPtr;
-    sfe_ism_data_t *accelData;
-    sfe_ism_data_t *gyroData;
+    sfe_ism_data_t *accelData = NULL;
+    sfe_ism_data_t *gyroData = NULL;
 
     bool checkData() override {
       //Check if new data is available
@@ -310,21 +495,24 @@ class BT_ISM330DHCX : public BTSensor {
       bool gotAccell = (this->sensorPtr)->getAccel(accelData);
       bool gotGyro = (this->sensorPtr)->getGyro(gyroData);
 
-      delete this->accelData;
-      delete this->gyroData;
-
+      sfe_ism_data_t* oldAccelData = this->accelData;
+      sfe_ism_data_t* oldGyroData = this->gyroData;
+      
       this->accelData = accelData;
       this->gyroData = gyroData;
+
+      delete oldAccelData;
+      delete oldGyroData;
     }
 
     String logData() override {
-      String logline = "";
       char buffer1[10];
       char buffer2[10];
       char buffer3[10];
       char buffer4[10];
       char buffer5[10];
       char buffer6[10];
+      char logline[100];
 
       sfe_ism_data_t accelData = *(this->accelData);
       sfe_ism_data_t gyroData = *(this->gyroData);
@@ -336,21 +524,18 @@ class BT_ISM330DHCX : public BTSensor {
       olaftoa(gyroData.xData, buffer4, 3, sizeof(buffer4) / sizeof(char));
       olaftoa(gyroData.yData, buffer5, 3, sizeof(buffer5) / sizeof(char));
       olaftoa(gyroData.zData, buffer6, 3, sizeof(buffer6) / sizeof(char));
-      logline += "," + String(buffer1) 
-        + "," + String(buffer2) 
-        + "," + String(buffer3) 
-        + "," + String(buffer4) 
-        + "," + String(buffer5) 
-        + "," + String(buffer6);
-      return logline;
+      sprintf(logline, ",%s,%s,%s,%s,%s,%s", buffer1, buffer2, buffer3, buffer4, buffer5, buffer6);
+
+      String loglineString = String(logline);
+      return loglineString;
     }
 
   public:
     BT_ISM330DHCX(uint8_t address) : BTSensor(address) {  
       //ISM330DHCX constructor
       this->setDataOutputs(6);
-      this->setHelperText(",AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ");
-      Serial.println("ISM330DHCX sensor constructed.");
+      this->setHelperText(F(",AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ"));
+      Serial.println(F("ISM330DHCX sensor constructed."));
     }
     ~BT_ISM330DHCX() {
       //ISM330DHCX destructor
@@ -359,17 +544,17 @@ class BT_ISM330DHCX : public BTSensor {
 
     bool begin() override {
       //ISM330DHCX begin
-      Serial.print("ISM330DHCX begin: 0x");
+      Serial.print(F("ISM330DHCX begin: 0x"));
       Serial.println(this->getAddress(), HEX);
       SparkFun_ISM330DHCX *myISM = new SparkFun_ISM330DHCX;
 
       int tries = 0;
 
       while( !(myISM->begin(qwiic, this->getAddress())) ){
-        Serial.println("Did not begin. Tying Again");
+        Serial.println(F("Did not begin. Tying Again"));
         delay(1000);
         if (tries > 5) {
-          Serial.println("Failed to begin ISM330DHCX");
+          Serial.println(F("Failed to begin ISM330DHCX"));
           return false;
         } else {
           tries++;
@@ -378,7 +563,7 @@ class BT_ISM330DHCX : public BTSensor {
 
       // Reset the device to default settings. This if helpful is you're doing multiple
       // uploads testing different settings. 
-      Serial.print("Resetting device.");
+      Serial.print(F("Resetting device."));
       myISM->deviceReset();
 
       // Wait for it to finish reseting
@@ -386,9 +571,9 @@ class BT_ISM330DHCX : public BTSensor {
         delay(10);
         Serial.print(".");
       } 
-      Serial.println(" Done.");
+      Serial.println(F(" Done."));
 
-      Serial.println("Applying settings.");
+      Serial.println(F("Applying settings."));
       delay(100);
       
       myISM->setDeviceConfig();
@@ -411,12 +596,12 @@ class BT_ISM330DHCX : public BTSensor {
       myISM->setGyroLP1Bandwidth(ISM_MEDIUM);
 
       //Wait for first data ready
-      Serial.print("Waiting for data.");
+      Serial.print(F("Waiting for data."));
       while(!(myISM->checkStatus())) {
         delay(100);
         Serial.print(".");
       }
-      Serial.println(" Done!");
+      Serial.println(F(" Done!"));
 
       this->sensorPtr = myISM;
 
@@ -463,8 +648,8 @@ class BT_VL53L1X : public BTSensor {
       this->sensorPtr = new SFEVL53L1X(qwiic);
       this->setLogStaleData(false);
       this->setDataOutputs(2);
-      this->setHelperText(",Range,RangeStatus");
-      Serial.println("VL53L1X sensor constructed.");
+      this->setHelperText(F(",Range,RangeStatus"));
+      Serial.println(F("VL53L1X sensor constructed."));
     }
     ~BT_VL53L1X() {
       //VL53L1X destructor   
@@ -472,7 +657,7 @@ class BT_VL53L1X : public BTSensor {
 
     bool begin() override {
       //VL53L1X begin
-      Serial.print("VL53L1X begin: 0x");
+      Serial.print(F("VL53L1X begin: 0x"));
       Serial.println(this->getAddress(), HEX);
       bool begin_sucess = (this->sensorPtr)->begin() == 0;
       if (!begin_sucess) {
@@ -502,6 +687,10 @@ typedef struct {
   unsigned long minLogInterval;
 } TrackerSettings;
 
+typedef struct {
+  bool sdOnline = false;
+} TrackerStatus;
+
 struct SensorNode {
   unsigned long logInterval;
   uint8_t address;
@@ -514,6 +703,7 @@ SensorNode *sensorsHead = NULL;
 SensorNode *sensorsTail = NULL;
 
 TrackerSettings globalSettings;
+TrackerStatus globalStatus;
 
 unsigned long getInterval(float frequency) {
   return (1000 * (1.0 / frequency)); //Convert frequency to interval in milliseconds
@@ -529,17 +719,134 @@ void addSensor(SensorNode *node) {
   }
 }
 
-void sdLogln(String *logline) {
-  if (globalSettings.logSD) {
-    //TODO: Log to SD card
+void microSDPowerOn()
+{
+  pinMode(PIN_MICROSD_POWER, OUTPUT);
+  pin_config(PinName(PIN_MICROSD_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+  digitalWrite(PIN_MICROSD_POWER, LOW);
+}
+
+void microSDPowerOff()
+{
+  pinMode(PIN_MICROSD_POWER, OUTPUT);
+  pin_config(PinName(PIN_MICROSD_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+  digitalWrite(PIN_MICROSD_POWER, HIGH);
+}
+
+void beginSD(bool silent)
+{
+  pinMode(PIN_MICROSD_POWER, OUTPUT);
+  pin_config(PinName(PIN_MICROSD_POWER), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+  pinMode(PIN_MICROSD_CHIP_SELECT, OUTPUT);
+  pin_config(PinName(PIN_MICROSD_CHIP_SELECT), g_AM_HAL_GPIO_OUTPUT); // Make sure the pin does actually get re-configured
+  digitalWrite(PIN_MICROSD_CHIP_SELECT, HIGH); //Be sure SD is deselected
+
+  // If the microSD card is present, it needs to be powered on otherwise the IMU will fail to start
+  // (The microSD card will pull the SPI pins low, preventing communication with the IMU)
+
+  // For reasons I don't understand, we seem to have to wait for at least 1ms after SPI.begin before we call microSDPowerOn.
+  // If you comment the next line, the Artemis resets at microSDPowerOn when beginSD is called from wakeFromSleep...
+  // But only on one of my V10 red boards. The second one I have doesn't seem to need the delay!?
+  delay(5);
+
+  microSDPowerOn();
+
+  //Max power up time is 250ms: https://www.kingston.com/datasheets/SDCIT-specsheet-64gb_en.pdf
+  //Max current is 200mA average across 1s, peak 300mA
+  delay(10);
+
+  if (sd.begin(SD_CONFIG) == false) // Try to begin the SD card using the correct chip select
+  {
+    Serial.println("SD init failed (first attempt). Trying again...\r\n");
+    delay(250);
+    if (sd.begin(SD_CONFIG) == false) // Try to begin the SD card using the correct chip select
+    {
+      if (!silent)
+      {
+        Serial.println("SD init failed (second attempt). Is card present? Formatted?");
+        Serial.println("Please ensure the SD card is formatted correctly using https://www.sdcard.org/downloads/formatter/");
+      }
+      digitalWrite(PIN_MICROSD_CHIP_SELECT, HIGH); //Be sure SD is deselected
+      globalStatus.sdOnline = false;
+      return;
+    }
+  }
+
+  //Change to root directory. All new file creation will be in root.
+  if (sd.chdir() == false)
+  {
+    if (!silent)
+    {
+      Serial.println("SD change directory failed");
+    }
+    globalStatus.sdOnline = false;
+    return;
+  }
+
+  globalStatus.sdOnline = true;
+}
+
+void bothLog(String log) {
+  if (globalSettings.logSerial) {
+    Serial.print(log);
+  }
+  if (globalSettings.logSD && globalStatus.sdOnline && logFile.isOpen()) {
+    logFile.print(log);
+  } else {
+    if(globalSettings.logSD) {
+      Serial.println("Cannot log to SD. SD card not online");
+      globalSettings.logSD = false;
+    }
   }
 }
+
+void bothLogln(String logline) {
+  bothLog(logline);
+  bothLog("\n\r");
+}
+
+#if(SD_STRESS_TEST == 1)
+void sdStressTest(int maxChars) {
+  srand(time(NULL));
+  Serial.println("Begin SD stress test.");
+  String logline = "";
+  for (int i = 0; i < maxChars; i++) {
+
+    char randomChar;
+    int randomNum = rand() % 29;  // generate a random number between 0 and 28
+    if (randomNum < 26) {
+        // generate a random lowercase or uppercase letter
+        randomChar = randomNum < 13 ? 'a' + randomNum : 'A' + randomNum - 13;
+    } else {
+        Serial.print("Added escape char this line: ");
+        // generate a random escape character
+        switch (randomNum) {
+            case 26:
+                randomChar = '\n';
+                break;
+            case 27:
+                randomChar = '\r';
+                break;
+            case 28:
+                randomChar = '\t';
+                break;
+        }
+    }
+    logline.concat(randomChar);
+    Serial.println(logline);
+    sdLogln(logline);
+    
+  }
+}
+#endif
 
 /*
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 */
 
 static unsigned long lastLogTime;
+
+char logBuffer[128];
 
 void setup() {
   
@@ -566,7 +873,6 @@ void setup() {
   //Begin qwiic
   beginQwiic();
 
-
   //If logging to serial, begin serial and wait for serial monitor
   if (globalSettings.logSerial) {
     Serial.begin(globalSettings.serialBaudRate);
@@ -574,6 +880,25 @@ void setup() {
       delay(10); // wait for serial port to connect. Needed for native USB port only
     }
   }
+
+  //Begin SD card:
+  beginSD(false);
+
+  //create a logfile
+  int fileNumber = 0;
+  String logfilename;
+  do {
+    logfilename = "log" + String(fileNumber) + ".csv";
+    fileNumber++;
+  } while(sd.exists(logfilename));
+
+  logFile = sd.open(logfilename, O_CREAT | O_APPEND | O_WRITE);
+  Serial.println("Opened logfile at: " + logfilename);
+
+  #if(SD_STRESS_TEST == 1)
+  //Conduct SD Card stress test
+  sdStressTest(200);
+  #endif
 
   //Detect and initialize sensors
   //TODO: Autodetect connected sensors
@@ -607,29 +932,39 @@ void setup() {
 
   //GNSS sensor
   addSensor(new SensorNode {
-    getInterval(0.1), //1Hz
+    getInterval(0.5), //0.5Hz
     GNSS_UBX,
     new BT_UBLOX(GNSS_UBX),
     millis(),
     NULL
   });
 
-  //TODO: Add ICM20948
+
+  /*
+  //Onboard IMU
+  addSensor(new SensorNode {
+    getInterval(150.0), //150 Hz
+    IMU_ICM20948_SPI,
+    new BT_ICM20948_SPI(IMU_ICM20948_SPI),
+    millis(),
+    NULL
+  });
+  */
 
   //begin sensors:
   SensorNode *node = sensorsHead;
   while(node != NULL) {
     if (node->sensor->begin()) {
       if (globalSettings.logSerial) {
-        Serial.print("Sensor at address 0x");
+        Serial.print(F("Sensor at address 0x"));
         Serial.print(node->address, HEX);
-        Serial.println(" initialized.");
+        Serial.println(F(" initialized."));
       }
     } else {
       if (globalSettings.logSerial) {
-        Serial.print("Sensor at address 0x");
+        Serial.print(F("Sensor at address 0x"));
         Serial.print(node->address, HEX);
-        Serial.println(" failed to initialize.");
+        Serial.println(F(" failed to initialize."));
 
         //remove this sensor from the list
         if (node == sensorsHead) {
@@ -647,28 +982,27 @@ void setup() {
     node = node->next;
   }
 
-  Serial.println("Done initializing sensors.");
+  Serial.println(F("Done initializing sensors."));
 
   //Print header:
   node = sensorsHead;
-  String header = "\n\n\rBiketracker";
+  bothLog(F("Biketracker"));
   //First line: sensor addresses
   while(node != NULL) {
-    header += node->sensor->getAddressHelperText();
-    node = node->next;
-  }
-  //Second line: data names
-  node = sensorsHead;
-  header += "\n\rTime_Millis";
-  while(node != NULL) {
-    header += node->sensor->getHelperText();
+    bothLog(node->sensor->getAddressHelperText());
     node = node->next;
   }
 
-  if (globalSettings.logSerial) {
-    Serial.println(header);
+  bothLog(NEW_LINE_STR);
+
+  //Second line: data names
+  node = sensorsHead;
+  bothLog(F("Time_Millis"));
+  while(node != NULL) {
+    bothLog(node->sensor->getHelperText());
+    node = node->next;
   }
-  sdLogln(&header);
+  bothLog(NEW_LINE_STR);
 
   //Set up timer for logging
   lastLogTime = millis();
@@ -685,14 +1019,14 @@ void loop() {
 
     //loop through sensors and log data
     SensorNode *node = sensorsHead;
-    String logline = "\r";
-    logline += String(currentTime);
+    sprintf(logBuffer, "%lu", currentTime);
+    bothLog(logBuffer);
     while(node != NULL) {
 
       //check if enough time has elapsed since last log
       if (node->logInterval + node->lastLogTime <= millis()) {
-        //log data
-        logline += node->sensor->log();
+        //request data logging (the sensor might refuse if the data is not ready)
+        bothLog(node->sensor->log());
         if (node->sensor->didLog()) {
           if(millis() - currentTime > node->logInterval) {
             //count from the end of logging to avoid bogging
@@ -704,13 +1038,11 @@ void loop() {
         }
       } else {
         //just print commas
-        logline += node->sensor->noLog();
+        sprintf(logBuffer, "%s", node->sensor->noLog());
+        bothLog(logBuffer);
       }
       node = node->next;
     }
-    if (globalSettings.logSerial) {
-      Serial.println(logline);
-    }
-    sdLogln(&logline);
+    bothLog(NEW_LINE_STR);
   }
 }
